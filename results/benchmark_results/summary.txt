@@ -1,0 +1,11 @@
+
+============================================================
+Benchmark Results
+  Julia threads available: 8
+  Monte Carlo trials     : 50
+============================================================
+  Serial (single run)                 0.71 ms     0.57 MB
+  Serial MC                          40.94 ms    41.04 MB
+  Parallel MC                         7.76 ms    42.06 MB
+  Parallel speedup                    5.28x
+============================================================

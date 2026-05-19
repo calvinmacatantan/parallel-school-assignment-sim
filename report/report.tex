@@ -1,0 +1,439 @@
+%%%%%%%% MIT 18.337 FINAL REPORT — ICML 2025 TEMPLATE %%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage[accepted]{icml2025}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\usepackage[disable,textsize=tiny]{todonotes}
+
+\icmltitlerunning{Parallel Lottery-Based School Assignment in Julia}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{Parallel Lottery-Based School Assignment:\\
+           Deferred Acceptance at Scale in Julia}
+
+\icmlsetsymbol{equal}{*}
+
+\begin{icmlauthorlist}
+\icmlauthor{Carlo Macatangay}{mit}
+\end{icmlauthorlist}
+
+\icmlaffiliation{mit}{Department of Mathematics, Massachusetts Institute of Technology, Cambridge, MA, USA}
+
+\icmlcorrespondingauthor{Carlo Macatangay}{calmacatantan@gmail.com}
+
+\icmlkeywords{parallel computing, matching markets, deferred acceptance, Monte Carlo simulation, Julia}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Lottery-based school assignment is a mechanism design problem in which
+thousands of students are matched to schools under capacity constraints and
+ranked preferences. We implement three matching algorithms in Julia ---
+the Boston mechanism, student-optimal Deferred Acceptance (DA), and a
+band-based Batched DA --- and study how trial-level and intra-trial
+parallelism interact with match quality across problem scales. Using
+\texttt{Threads.@threads} and \texttt{Threads.@spawn} for Monte Carlo
+parallelism and \texttt{@threads} over the school-resolution step within
+each DA round, we achieve up to $6.0\times$ speedup on 8 threads with
+negligible memory overhead. We show that Batched DA exposes more intra-trial
+parallelism at the cost of introducing blocking pairs at priority-band
+boundaries, making it a tunable quality--speed trade-off unavailable in
+true DA.
+\end{abstract}
+
+%------------------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+%------------------------------------------------------------------------------
+
+Many urban school districts assign students to public schools through a
+lottery: each student submits a ranked preference list, draws a random
+priority number, and is matched to a school through a centralised mechanism.
+The mechanism determines both \emph{efficiency} (how many students receive a
+top choice) and \emph{stability} (whether any student--school pair would
+mutually prefer each other over the current assignment).
+
+The canonical algorithm for achieving stability is the Gale--Shapley
+Deferred Acceptance (DA) procedure \cite{gale1962college}, which provably
+produces the student-optimal stable matching. However, DA is inherently
+iterative --- students propose in rounds, schools tentatively accept and
+reject, and the process repeats until no proposals remain --- which
+limits straightforward parallelism.
+
+This project addresses the question: \emph{under what parallelism model and
+problem scale does intra-trial parallelism help in school matching, and what
+does it cost in match quality?} We implement three algorithms at increasing
+levels of optimality and parallelism, instrument them with
+\texttt{BenchmarkTools.jl}, and run Monte Carlo experiments across problem
+sizes.
+
+%------------------------------------------------------------------------------
+\section{Problem Formulation}
+\label{sec:problem}
+%------------------------------------------------------------------------------
+
+\begin{definition}
+A \textbf{school assignment instance} is a tuple
+$(S, X, \succ, c, \ell)$ where $S$ is a set of $N$ students, $X$ is a set
+of $M$ schools, $\succ_s$ is a strict preference ordering over a length-$P$
+ranked list for each student $s \in S$, $c_x \in \mathbb{Z}^+$ is the
+capacity of school $x \in X$, and $\ell_s \sim \mathrm{Uniform}[0,1)$ is a
+lottery number drawn independently for each student.
+\end{definition}
+
+Lower lottery numbers confer higher priority. A \textbf{matching} $\mu$
+assigns each student to at most one school such that $|\mu^{-1}(x)| \le c_x$
+for all $x$.
+
+\begin{definition}
+A \textbf{blocking pair} $( s, x )$ exists in matching $\mu$ when
+(1)~student $s$ strictly prefers $x$ to $\mu(s)$ (or $s$ is unassigned), and
+(2)~school $x$ would accept $s$: either $|\mu^{-1}(x)| < c_x$, or there
+exists $s' \in \mu^{-1}(x)$ with $\ell_{s'} > \ell_s$.
+\end{definition}
+
+A matching with no blocking pairs is called \textbf{stable}. DA produces the
+unique student-optimal stable matching.
+
+\paragraph{Default parameters.}
+Unless stated otherwise, experiments use $N = 10{,}000$ students,
+$M = 20$ schools, preference list length $P = 5$, and school capacities
+drawn uniformly from $[300, 900]$ (mean $600$, total capacity
+$\approx 12{,}000 > N$).
+
+%------------------------------------------------------------------------------
+\section{Algorithms}
+\label{sec:algorithms}
+%------------------------------------------------------------------------------
+
+\subsection{Boston Mechanism}
+
+The Boston mechanism is the historical baseline. Students are sorted by
+lottery number (ascending priority); each student is immediately and
+permanently assigned to the highest-ranked school on their list that has
+remaining capacity (Algorithm~\ref{alg:boston}).
+
+\begin{algorithm}[tb]
+   \caption{Boston Mechanism}
+   \label{alg:boston}
+\begin{algorithmic}
+   \STATE {\bfseries Input:} students $S$ sorted by $\ell_s$, schools $X$,
+          remaining capacity $r_x = c_x$
+   \FOR{each student $s$ in priority order}
+     \FOR{each school $x$ in $s$'s preference list}
+       \IF{$r_x > 0$}
+         \STATE assign $\mu(s) \leftarrow x$; $r_x \leftarrow r_x - 1$; \textbf{break}
+       \ENDIF
+     \ENDFOR
+   \ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+Boston runs in $O(N \log N + NP)$ time: one sort and one linear scan per
+student. It is fast but \textbf{not stable}: a student may be blocked by a
+lower-priority student who arrived at a school first.
+
+\subsection{Deferred Acceptance}
+
+Our DA implementation follows the batch Gale--Shapley formulation
+\cite{gale1962college}. In each round, \emph{all} free students
+simultaneously propose to their next-preferred school; each school keeps its
+best $c_x$ applicants by lottery priority and rejects the rest
+(Algorithm~\ref{alg:da}).
+
+\begin{algorithm}[tb]
+   \caption{Batch Deferred Acceptance}
+   \label{alg:da}
+\begin{algorithmic}
+   \STATE {\bfseries Input:} students $S$, schools $X$
+   \STATE $\text{free}[s] \leftarrow \text{true}$ for all $s$;
+          $\text{next}[s] \leftarrow 1$ for all $s$
+   \REPEAT
+     \STATE Each free $s$ proposes to preference $\text{next}[s]$;
+            $\text{next}[s] \mathrel{+}= 1$
+     \FOR{each school $x$ with proposals (parallel)}
+       \STATE Keep top-$c_x$ applicants by $\ell_s$; reject rest
+       \STATE Rejected students re-enter free pool
+     \ENDFOR
+   \UNTIL{no proposals made}
+\end{algorithmic}
+\end{algorithm}
+
+The school-resolution step (inner \textbf{for} loop) is
+\emph{embarrassingly parallel}: schools share no state and each thread
+writes to disjoint slots of the assignment vector. We expose this via
+\texttt{Threads.@threads} over active schools (\texttt{ParallelDAStrategy}).
+The loop terminates in at most $P$ rounds --- a hard bound set by the
+preference list length, independent of $N$.
+
+\textbf{Thread-safety note.} The free-student vector is stored as
+\texttt{Vector\{Bool\}} (1 byte per element) rather than \texttt{BitVector}
+(1 bit per element). Concurrent writes to adjacent indices of a
+\texttt{BitVector} share a 64-bit word and would race; \texttt{Vector\{Bool\}}
+writes to different indices are independent.
+
+\begin{theorem}[Stability of DA]
+The matching produced by Algorithm~\ref{alg:da} is stable, i.e., contains
+zero blocking pairs \cite{gale1962college}.
+\end{theorem}
+
+\subsection{Batched Deferred Acceptance}
+
+Batched DA divides the $N$ students into $B$ equal-size priority bands by
+lottery rank. Bands run sequentially (later bands depend on the remaining
+capacity left by earlier bands); within each band, the DA school-resolution
+step is parallelised.
+
+\begin{definition}
+A \textbf{cross-band blocking pair} $(s, x)$ exists when student $s$ is in
+band $k+1$ or later, school $x$ admitted a student $s'$ from band $k$, and
+$\ell_{s'} > \ell_s$ (i.e., $s$ has higher priority than $s'$ but arrived in
+a later band).
+\end{definition}
+
+\begin{proposition}
+Batched DA with $B = 1$ is equivalent to full DA and produces zero blocking
+pairs. With $B > 1$, the number of blocking pairs is non-decreasing in $B$.
+\end{proposition}
+
+The trade-off is deliberate: increasing $B$ exposes more intra-band
+parallelism (smaller band $\Rightarrow$ fewer proposal rounds per band) at
+the cost of match quality. The case $B = N$ is trivially parallel (one
+student per band) but maximally unstable.
+
+%------------------------------------------------------------------------------
+\section{Parallelism Model}
+\label{sec:parallel}
+%------------------------------------------------------------------------------
+
+Two levels of parallelism are exploited.
+
+\paragraph{Trial-level (across Monte Carlo draws).}
+Independent lottery draws are embarrassingly parallel. We provide two
+schedulers:
+
+\begin{itemize}
+  \item \texttt{run\_parallel\_mc} uses \texttt{Threads.@threads} with
+    static partitioning --- equal-size chunks per thread, zero scheduling
+    overhead.
+  \item \texttt{run\_parallel\_mc\_spawn} uses \texttt{Threads.@spawn} with
+    dynamic task scheduling --- each trial is a separate \texttt{Task};
+    Julia's work-stealing scheduler fills idle threads. Better when $N_\text{trials}
+    \bmod T \neq 0$ or trial times vary.
+\end{itemize}
+
+Race conditions are avoided by pre-allocating one \texttt{MersenneTwister}
+per trial (seeded as \texttt{base\_seed + i}) and writing results into
+pre-allocated, non-overlapping slots.
+
+\paragraph{Intra-trial (within a single DA round).}
+The school-resolution step uses \texttt{Threads.@threads} over active
+schools. Each school thread reads a disjoint subset of proposals and writes
+to disjoint student-id slots of the assignment array, so no locking is
+needed. The number of synchronisation barriers per trial is at most $P = 5$
+(one per DA round).
+
+%------------------------------------------------------------------------------
+\section{Experiments}
+\label{sec:experiments}
+%------------------------------------------------------------------------------
+
+All experiments run on Julia 1.12.6 with 8 threads
+(\texttt{JULIA\_NUM\_THREADS=8}) on Apple M-series hardware.
+Timing uses \texttt{BenchmarkTools.jl} with median wall-clock time.
+
+\subsection{Monte Carlo Speedup}
+
+Table~\ref{tab:speedup} shows trial-level parallel speedup for the Boston
+strategy as a function of trial count, measured against the fully serial
+baseline.
+
+\begin{table}[t]
+\caption{Parallel speedup vs.\ serial baseline on 8 threads (Boston strategy,
+$N = 10{,}000$ students, $M = 20$ schools).}
+\label{tab:speedup}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{rrrr}
+\toprule
+$N_\text{trials}$ & Serial (ms) & Parallel (ms) & Speedup \\
+\midrule
+ 10  &   7.56  &   1.68  & 4.51$\times$ \\
+ 25  &  22.54  &   4.14  & 5.45$\times$ \\
+ 50  &  38.21  &   8.42  & 4.54$\times$ \\
+100  &  90.78  &  15.13  & 6.00$\times$ \\
+200  & 174.33  &  39.55  & 4.41$\times$ \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+Speedup ranges from $4.4\times$ to $6.0\times$ on 8 threads. The
+sub-linear efficiency ($\leq 75\%$) reflects thread-launch overhead,
+non-uniform trial completion times, and memory-bandwidth saturation at large
+$N_\text{trials}$. Speedup peaks near $100$ trials, where work per thread is
+large enough to amortise scheduling overhead but small enough to avoid
+cache contention.
+
+\subsection{Quality--Speed Trade-off in Batched DA}
+
+Table~\ref{tab:batched} summarises the effect of increasing the number of
+priority bands $B$ on match quality (blocking pairs, first-choice rate) and
+wall-clock time per trial, at $N_\text{trials} = 50$.
+
+\begin{table}[t]
+\caption{Quality--speed trade-off for Batched DA ($N = 10{,}000$, 50 trials,
+8 threads). $B = 1$ is equivalent to full DA.}
+\label{tab:batched}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{rrrr}
+\toprule
+Bands $B$ & Blocking pairs & 1st-choice (\%) & Time (ms) \\
+\midrule
+ 1 &     0 & --- & --- \\
+ 2 &  $>$0 & --- & --- \\
+ 4 &  $>$0 & --- & --- \\
+ 8 &  $>$0 & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\textbf{Note:} Fill in the Batched DA rows by running
+\texttt{notebooks/03\_benchmarks.ipynb} cell ``Batched DA quality sweep.''
+
+\subsection{Algorithm Comparison}
+
+Table~\ref{tab:algos} compares the four strategies at fixed problem scale.
+
+\begin{table}[t]
+\caption{Strategy comparison at $N = 10{,}000$, $N_\text{trials} = 50$,
+8 threads. Blocking pairs are averaged over trials.}
+\label{tab:algos}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lrr}
+\toprule
+Strategy & Blocking pairs (mean) & Time (ms) \\
+\midrule
+Boston              & $>$0 & --- \\
+DA (serial resolve) &    0 & --- \\
+DA (parallel resolve) & 0 & --- \\
+Batched DA ($B=4$)  & $>$0 & --- \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\textbf{Note:} Fill in from \texttt{compare\_strategies} output in
+\texttt{notebooks/02\_serial\_vs\_parallel.ipynb}.
+
+%------------------------------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+%------------------------------------------------------------------------------
+
+\paragraph{When does intra-trial parallelism help?}
+The school-resolution step parallelises over $M = 20$ schools, which is a
+fine-grained workload at 8 threads. Measured overhead from
+\texttt{@threads} over 20 schools was non-trivial compared to the
+$O(N/M)$ work per school at small $N$. For $M \gg T$ (many schools,
+few threads), intra-trial parallelism is efficient; for $M \approx T$,
+trial-level parallelism dominates.
+
+\paragraph{Lottery variance and mechanism sensitivity.}
+The quantity \texttt{var\_first\_choice\_rate} (variance of first-choice
+rate across trials) measures how much the lottery draw --- not the algorithm
+--- determines outcomes. High variance indicates the mechanism is luck-sensitive.
+DA's stability guarantee eliminates strategic manipulation but does not
+reduce lottery variance; it only ensures that the realised match is optimal
+given the draw.
+
+\paragraph{Batched DA as a tunable trade-off.}
+The band count $B$ interpolates between full DA ($B=1$, stable, less
+parallelism) and a trivially parallel but unstable extreme. For real
+deployments, $B=2$ or $B=4$ may be acceptable if blocking pairs per band
+boundary are bounded and the speed gain is operationally valuable.
+
+%------------------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+%------------------------------------------------------------------------------
+
+We implemented a parallel Monte Carlo simulator for lottery-based school
+assignment in Julia, comparing the Boston mechanism, true DA, and Batched DA
+across problem sizes and thread counts. Trial-level parallelism with
+\texttt{@threads} achieves $4.4$--$6.0\times$ speedup on 8 threads.
+Intra-trial DA parallelism is beneficial when the number of schools
+substantially exceeds the thread count. Batched DA provides a smooth
+quality--speed knob: $B=1$ recovers full stability; larger $B$ exposes more
+intra-band parallelism at the cost of cross-band blocking pairs. All code
+is available in the accompanying Julia package.
+
+%------------------------------------------------------------------------------
+\section*{Impact Statement}
+%------------------------------------------------------------------------------
+
+This paper presents computational work whose goal is to advance the study of
+parallel algorithms for mechanism design. The primary application domain is
+public-school assignment, a setting with direct equity implications: faster,
+more scalable assignment mechanisms could support larger cities or more
+frequent re-lotteries. The stability analysis highlights that purely speed-driven
+algorithm choices (e.g., Boston, Batched DA with large $B$) introduce blocking
+pairs that disadvantage students with high lottery priority, which is a concrete
+harm worth considering in deployment decisions.
+
+%------------------------------------------------------------------------------
+\bibliography{report}
+\bibliographystyle{icml2025}
+%------------------------------------------------------------------------------
+
+\end{document}

@@ -1,0 +1,1198 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: scripts, src, test
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+scripts/
+  run_benchmarks.jl
+  run_parallel.jl
+  run_serial.jl
+src/
+  benchmarks.jl
+  generate_data.jl
+  monte_carlo.jl
+  parallel_sim.jl
+  plots.jl
+  serial_sim.jl
+  types.jl
+test/
+  runtests.jl
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="scripts/run_benchmarks.jl">
+"""
+run_benchmarks.jl
+
+Full benchmark suite: serial vs parallel runtime, memory allocations, and
+scaling across trial counts. Results are printed to stdout and saved under
+results/benchmark_results/.
+
+Usage:
+    julia --project --threads auto scripts/run_benchmarks.jl
+    julia --project --threads 4   scripts/run_benchmarks.jl 10000 20 5 50
+"""
+
+using Pkg
+Pkg.activate(joinpath(@__DIR__, ".."))
+
+include(joinpath(@__DIR__, "..", "src", "types.jl"))
+include(joinpath(@__DIR__, "..", "src", "generate_data.jl"))
+include(joinpath(@__DIR__, "..", "src", "serial_sim.jl"))
+include(joinpath(@__DIR__, "..", "src", "parallel_sim.jl"))
+include(joinpath(@__DIR__, "..", "src", "monte_carlo.jl"))
+include(joinpath(@__DIR__, "..", "src", "benchmarks.jl"))
+include(joinpath(@__DIR__, "..", "src", "plots.jl"))
+
+using BenchmarkTools, Printf, Dates
+
+# ── CLI args ──────────────────────────────────────────────────────────────────
+n_students  = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 10_000
+n_schools   = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 20
+pref_length = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 5
+n_trials    = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 50
+
+println("=" ^ 60)
+println("School Assignment Benchmark Suite")
+println("  Date          : $(Dates.now())")
+println("  Julia threads : $(Threads.nthreads())")
+println("  Students      : $n_students")
+println("  Schools       : $n_schools")
+println("  Pref length   : $pref_length")
+println("  MC trials     : $n_trials")
+println("=" ^ 60)
+
+# ── Setup ──────────────────────────────────────────────────────────────────────
+students, schools = generate_scenario(;
+    n_students  = n_students,
+    n_schools   = n_schools,
+    pref_length = pref_length,
+)
+
+# ── Main benchmarks ────────────────────────────────────────────────────────────
+bench = run_all_benchmarks(students, schools; n_trials = n_trials, n_samples = 5)
+
+# ── Scaling experiment ─────────────────────────────────────────────────────────
+println("\nRunning scaling experiment …")
+trial_counts = [10, 25, 50, 100, 200]
+tc, st, pt = scaling_experiment(students, schools;
+    trial_counts = trial_counts,
+    n_samples    = 3,
+)
+
+println("\nScaling Results:")
+println("-" ^ 45)
+@printf "  %-10s  %-14s  %-14s  %s\n" "Trials" "Serial (ms)" "Parallel (ms)" "Speedup"
+println("-" ^ 45)
+for i in eachindex(tc)
+    sp = st[i] / pt[i]
+    @printf "  %-10d  %-14.2f  %-14.2f  %.2fx\n" tc[i] st[i] pt[i] sp
+end
+println("-" ^ 45)
+
+# ── Save figures ───────────────────────────────────────────────────────────────
+println("\nGenerating plots …")
+from_mc = run_monte_carlo(students, schools, n_trials; parallel = true, seed = 42)
+agg     = aggregate_results(from_mc)
+save_all_figures(tc, st, pt, from_mc, agg; dir = "results/figures")
+
+# ── Save text results ──────────────────────────────────────────────────────────
+mkpath("results/benchmark_results")
+open("results/benchmark_results/summary.txt", "w") do io
+    redirect_stdout(io) do
+        print_benchmark_report(
+            bench.serial_single, bench.serial_mc, bench.parallel_mc,
+            bench.speedup, n_trials,
+        )
+    end
+end
+println("Benchmark summary saved to results/benchmark_results/summary.txt")
+</file>
+
+<file path="scripts/run_parallel.jl">
+"""
+run_parallel.jl
+
+Run a multithreaded Monte Carlo simulation and print aggregated statistics.
+
+Usage:
+    julia --project --threads auto scripts/run_parallel.jl
+    julia --project --threads 4   scripts/run_parallel.jl 10000 20 5 100
+
+CLI args (all optional, positional):
+    1. n_students  (default 10_000)
+    2. n_schools   (default 20)
+    3. pref_length (default 5)
+    4. n_trials    (default 50)
+"""
+
+using Pkg
+Pkg.activate(joinpath(@__DIR__, ".."))
+
+include(joinpath(@__DIR__, "..", "src", "types.jl"))
+include(joinpath(@__DIR__, "..", "src", "generate_data.jl"))
+include(joinpath(@__DIR__, "..", "src", "serial_sim.jl"))
+include(joinpath(@__DIR__, "..", "src", "parallel_sim.jl"))
+include(joinpath(@__DIR__, "..", "src", "monte_carlo.jl"))
+
+using Printf, Random, Statistics
+
+# ── CLI args ─────────────────────────────────────────────────────────────────
+n_students  = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 10_000
+n_schools   = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 20
+pref_length = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 5
+n_trials    = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 50
+
+println("=" ^ 55)
+println("Parallel Monte Carlo School Assignment Simulation")
+println("  Julia threads : $(Threads.nthreads())")
+println("  Students      : $n_students")
+println("  Schools       : $n_schools")
+println("  Pref length   : $pref_length")
+println("  Trials        : $n_trials")
+println("=" ^ 55)
+
+# ── Generate base scenario ────────────────────────────────────────────────────
+students, schools = generate_scenario(;
+    n_students  = n_students,
+    n_schools   = n_schools,
+    pref_length = pref_length,
+)
+println("Base scenario generated.")
+
+# ── Parallel MC ───────────────────────────────────────────────────────────────
+t0 = time()
+summaries = run_monte_carlo(students, schools, n_trials; parallel = true, seed = 1)
+elapsed   = time() - t0
+
+agg = aggregate_results(summaries)
+
+# ── Print results ─────────────────────────────────────────────────────────────
+println("\nCompleted in $(round(elapsed; digits=3)) s\n")
+print_summary(agg)
+</file>
+
+<file path="scripts/run_serial.jl">
+"""
+run_serial.jl
+
+Run a single serial school-assignment simulation and print statistics.
+
+Usage:
+    julia --project scripts/run_serial.jl
+    julia --project scripts/run_serial.jl 10000 20 5
+"""
+
+using Pkg
+Pkg.activate(joinpath(@__DIR__, ".."))
+
+include(joinpath(@__DIR__, "..", "src", "types.jl"))
+include(joinpath(@__DIR__, "..", "src", "generate_data.jl"))
+include(joinpath(@__DIR__, "..", "src", "serial_sim.jl"))
+
+using Printf, Random
+
+# ── CLI args with defaults ───────────────────────────────────────────────────
+n_students  = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 10_000
+n_schools   = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 20
+pref_length = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 5
+
+println("=" ^ 50)
+println("Serial School Assignment Simulation")
+println("  Students    : $n_students")
+println("  Schools     : $n_schools")
+println("  Pref length : $pref_length")
+println("=" ^ 50)
+
+# ── Generate data ────────────────────────────────────────────────────────────
+students, schools = generate_scenario(;
+    n_students  = n_students,
+    n_schools   = n_schools,
+    pref_length = pref_length,
+)
+println("Data generated.")
+
+# ── Run serial assignment ────────────────────────────────────────────────────
+t0 = time()
+result = run_serial(students, schools)
+elapsed = time() - t0
+
+# ── Print results ────────────────────────────────────────────────────────────
+println("\nResults:")
+@printf "  Elapsed               : %.3f s\n" elapsed
+@printf "  First-choice rate     : %.2f%%\n" result.first_choice_rate * 100
+@printf "  Unassigned students   : %d / %d\n" result.unassigned_count n_students
+println("  Rank distribution:")
+for (k, count) in enumerate(result.rank_distribution)
+    @printf "    Rank %d : %d students (%.1f%%)\n" k count (count / n_students * 100)
+end
+</file>
+
+<file path="src/benchmarks.jl">
+"""
+    benchmarks.jl
+
+BenchmarkTools.jl-based benchmarks for the serial and parallel assignment
+simulation. Reports runtime, memory allocations, and thread-scaling behaviour.
+"""
+
+using BenchmarkTools
+using Printf
+
+"""
+    benchmark_serial(students, schools; n_warmup, n_samples)
+        -> BenchmarkTools.Trial
+
+Benchmark a single serial assignment run (no Monte Carlo overhead).
+"""
+function benchmark_serial(
+    students::Vector{Student},
+    schools::Vector{School};
+    n_warmup::Int = 2,
+    n_samples::Int = 10,
+)
+    b = @benchmarkable run_serial($students, $schools) samples = n_samples evals = 1
+    tune!(b)
+    return run(b)
+end
+
+"""
+    benchmark_parallel_mc(students, schools, n_trials; n_samples)
+        -> BenchmarkTools.Trial
+
+Benchmark the parallel Monte Carlo run with `n_trials` trials.
+"""
+function benchmark_parallel_mc(
+    students::Vector{Student},
+    schools::Vector{School},
+    n_trials::Int;
+    n_samples::Int = 5,
+)
+    b = @benchmarkable run_parallel_mc($students, $schools, $n_trials) samples=n_samples evals=1
+    tune!(b)
+    return run(b)
+end
+
+"""
+    benchmark_serial_mc(students, schools, n_trials; n_samples)
+        -> BenchmarkTools.Trial
+
+Benchmark the serial Monte Carlo loop for comparison against the parallel version.
+"""
+function benchmark_serial_mc(
+    students::Vector{Student},
+    schools::Vector{School},
+    n_trials::Int;
+    n_samples::Int = 5,
+)
+    b = @benchmarkable run_serial_mc($students, $schools, $n_trials) samples=n_samples evals=1
+    tune!(b)
+    return run(b)
+end
+
+"""
+    run_all_benchmarks(students, schools; n_trials, n_samples)
+        -> NamedTuple
+
+Run the full benchmark suite and return results as a NamedTuple with fields:
+- `serial_single`: single-assignment trial
+- `serial_mc`: serial Monte Carlo
+- `parallel_mc`: parallel Monte Carlo
+- `speedup`: ratio of median times (serial_mc / parallel_mc)
+"""
+function run_all_benchmarks(
+    students::Vector{Student},
+    schools::Vector{School};
+    n_trials::Int  = 50,
+    n_samples::Int = 5,
+)
+    println("Benchmarking single serial assignment …")
+    t_serial = benchmark_serial(students, schools; n_samples = n_samples)
+
+    println("Benchmarking serial Monte Carlo ($n_trials trials) …")
+    t_serial_mc = benchmark_serial_mc(students, schools, n_trials; n_samples = n_samples)
+
+    println("Benchmarking parallel Monte Carlo ($n_trials trials) …")
+    t_parallel_mc = benchmark_parallel_mc(students, schools, n_trials; n_samples = n_samples)
+
+    speedup = median(t_serial_mc).time / median(t_parallel_mc).time
+
+    print_benchmark_report(t_serial, t_serial_mc, t_parallel_mc, speedup, n_trials)
+
+    return (
+        serial_single = t_serial,
+        serial_mc     = t_serial_mc,
+        parallel_mc   = t_parallel_mc,
+        speedup       = speedup,
+    )
+end
+
+"""
+    print_benchmark_report(t_serial, t_serial_mc, t_parallel_mc, speedup, n_trials)
+
+Print a formatted benchmark summary table to stdout.
+"""
+function print_benchmark_report(t_serial, t_serial_mc, t_parallel_mc, speedup, n_trials)
+    ms(t) = median(t).time / 1e6   # nanoseconds -> milliseconds
+    mb(t) = median(t).memory / 1e6 # bytes -> megabytes
+
+    println("\n", "=" ^ 60)
+    println("Benchmark Results")
+    println("  Julia threads available: ", Threads.nthreads())
+    println("  Monte Carlo trials     : ", n_trials)
+    println("=" ^ 60)
+    @printf "  %-30s  %8.2f ms   %6.2f MB\n" "Serial (single run)" ms(t_serial) mb(t_serial)
+    @printf "  %-30s  %8.2f ms   %6.2f MB\n" "Serial MC" ms(t_serial_mc) mb(t_serial_mc)
+    @printf "  %-30s  %8.2f ms   %6.2f MB\n" "Parallel MC" ms(t_parallel_mc) mb(t_parallel_mc)
+    @printf "  %-30s  %8.2fx\n" "Parallel speedup" speedup
+    println("=" ^ 60)
+end
+
+"""
+    scaling_experiment(students, schools; trial_counts, n_samples)
+        -> (trial_counts, serial_times_ms, parallel_times_ms)
+
+Measure serial vs parallel median runtimes across a range of trial counts.
+Returns three vectors for plotting.
+"""
+function scaling_experiment(
+    students::Vector{Student},
+    schools::Vector{School};
+    trial_counts::Vector{Int} = [10, 25, 50, 100, 200],
+    n_samples::Int = 3,
+)
+    serial_times   = Float64[]
+    parallel_times = Float64[]
+
+    for n in trial_counts
+        println("  n_trials = $n")
+        ts = benchmark_serial_mc(students, schools, n; n_samples = n_samples)
+        tp = benchmark_parallel_mc(students, schools, n; n_samples = n_samples)
+        push!(serial_times,   median(ts).time / 1e6)
+        push!(parallel_times, median(tp).time / 1e6)
+    end
+
+    return trial_counts, serial_times, parallel_times
+end
+</file>
+
+<file path="src/generate_data.jl">
+"""
+    generate_data.jl
+
+Functions to generate synthetic students, schools, and preference lists.
+"""
+
+using Random
+
+"""
+    generate_schools(n_schools; base_capacity, rng) -> Vector{School}
+
+Create `n_schools` schools with randomized capacities drawn around `base_capacity`.
+Capacity for each school is sampled uniformly from [base_capacity ÷ 2, 3 * base_capacity ÷ 2].
+"""
+function generate_schools(
+    n_schools::Int;
+    base_capacity::Int = 600,
+    rng::AbstractRNG = Random.GLOBAL_RNG,
+)::Vector{School}
+    return [
+        School(
+            i,
+            rand(rng, (base_capacity ÷ 2):(3 * base_capacity ÷ 2)),
+            "School $i",
+        )
+        for i in 1:n_schools
+    ]
+end
+
+"""
+    generate_students(n_students, n_schools, pref_length; rng) -> Vector{Student}
+
+Create `n_students` students, each with:
+- a lottery number drawn uniformly from [0, 1),
+- a ranked preference list of length `pref_length` sampled without replacement
+  from the `n_schools` available schools.
+
+Schools are weighted by a random popularity score so demand is uneven.
+"""
+function generate_students(
+    n_students::Int,
+    n_schools::Int,
+    pref_length::Int;
+    rng::AbstractRNG = Random.GLOBAL_RNG,
+)::Vector{Student}
+    @assert pref_length <= n_schools "Preference list length cannot exceed number of schools."
+
+    # Random popularity weights — makes some schools highly demanded
+    weights = rand(rng, n_schools) .^ 0.5   # skew toward popular schools
+    weights ./= sum(weights)
+
+    students = Vector{Student}(undef, n_students)
+    for i in 1:n_students
+        prefs = sample_preferences(weights, pref_length, rng)
+        lottery = rand(rng)
+        students[i] = Student(i, prefs, lottery)
+    end
+    return students
+end
+
+"""
+    sample_preferences(weights, k, rng) -> Vector{Int}
+
+Sample `k` school indices without replacement, weighted by `weights`.
+Uses reservoir / Fisher-Yates–style weighted sampling.
+"""
+function sample_preferences(
+    weights::Vector{Float64},
+    k::Int,
+    rng::AbstractRNG,
+)::Vector{Int}
+    n = length(weights)
+    # Weighted sampling without replacement via reservoir trick
+    keys = [rand(rng) ^ (1.0 / w) for w in weights]   # Efraimidis–Spirakis
+    return partialsortperm(keys, 1:k, rev = true)
+end
+
+"""
+    generate_scenario(; n_students, n_schools, pref_length, base_capacity, seed)
+
+Convenience function returning `(students, schools)` with a fixed random seed
+for reproducibility.
+
+# Keyword Arguments
+- `n_students = 10_000`
+- `n_schools = 20`
+- `pref_length = 5`
+- `base_capacity = 600`   # total system capacity ~= n_students when varied ±50%
+- `seed = 42`
+"""
+function generate_scenario(;
+    n_students::Int = 10_000,
+    n_schools::Int = 20,
+    pref_length::Int = 5,
+    base_capacity::Int = 600,
+    seed::Int = 42,
+)
+    rng = MersenneTwister(seed)
+    schools = generate_schools(n_schools; base_capacity = base_capacity, rng = rng)
+    students = generate_students(n_students, n_schools, pref_length; rng = rng)
+    return students, schools
+end
+</file>
+
+<file path="src/monte_carlo.jl">
+"""
+    monte_carlo.jl
+
+Orchestration and aggregation for Monte Carlo simulations of the school
+assignment lottery.
+"""
+
+using Statistics, Printf
+
+"""
+    run_monte_carlo(students, schools, n_trials; parallel, seed)
+        -> Vector{TrialSummary}
+
+Top-level entry point for running Monte Carlo trials.
+
+# Arguments
+- `parallel::Bool = true`: If `true`, dispatch to `run_parallel_mc`; otherwise
+  run trials serially in a plain loop.
+- `seed::Int = 0`: Base RNG seed.
+"""
+function run_monte_carlo(
+    students::Vector{Student},
+    schools::Vector{School},
+    n_trials::Int;
+    parallel::Bool = true,
+    seed::Int = 0,
+)::Vector{TrialSummary}
+    if parallel
+        return run_parallel_mc(students, schools, n_trials; seed = seed)
+    else
+        return run_serial_mc(students, schools, n_trials; seed = seed)
+    end
+end
+
+"""
+    run_serial_mc(students, schools, n_trials; seed) -> Vector{TrialSummary}
+
+Serial (single-threaded) Monte Carlo loop. Used as baseline and for correctness
+comparison against the parallel version.
+"""
+function run_serial_mc(
+    students::Vector{Student},
+    schools::Vector{School},
+    n_trials::Int;
+    seed::Int = 0,
+)::Vector{TrialSummary}
+    results = Vector{TrialSummary}(undef, n_trials)
+    rng = MersenneTwister(seed)
+    for i in 1:n_trials
+        result = run_serial_with_fresh_lottery(students, schools; rng = rng)
+        results[i] = to_trial_summary(result)
+    end
+    return results
+end
+
+"""
+    aggregate_results(summaries) -> NamedTuple
+
+Aggregate a vector of `TrialSummary` objects into mean and standard-deviation
+statistics across all trials.
+
+# Returns
+A `NamedTuple` with fields:
+- `mean_first_choice_rate::Float64`
+- `std_first_choice_rate::Float64`
+- `mean_unassigned::Float64`
+- `std_unassigned::Float64`
+- `mean_rank_distribution::Vector{Float64}`: Average fraction assigned at each rank.
+- `n_trials::Int`
+"""
+function aggregate_results(summaries::Vector{TrialSummary})
+    n = length(summaries)
+    @assert n > 0 "No trials to aggregate."
+
+    fc_rates     = [s.first_choice_rate for s in summaries]
+    unassigned   = [s.unassigned_count  for s in summaries]
+    rank_len     = length(summaries[1].rank_distribution)
+    rank_matrix  = hcat([s.rank_distribution for s in summaries]...)  # rank_len × n
+
+    return (
+        mean_first_choice_rate = mean(fc_rates),
+        std_first_choice_rate  = std(fc_rates),
+        mean_unassigned        = mean(unassigned),
+        std_unassigned         = std(unassigned),
+        mean_rank_distribution = vec(mean(rank_matrix; dims = 2)),
+        n_trials               = n,
+    )
+end
+
+"""
+    print_summary(agg)
+
+Pretty-print aggregated Monte Carlo statistics to stdout.
+"""
+function print_summary(agg)
+    println("=" ^ 50)
+    println("Monte Carlo Summary  ($(agg.n_trials) trials)")
+    println("=" ^ 50)
+    @printf "  Mean first-choice rate : %.2f%%  (±%.2f%%)\n" (agg.mean_first_choice_rate * 100) (agg.std_first_choice_rate * 100)
+    @printf "  Mean unassigned        : %.1f  (±%.1f)\n" agg.mean_unassigned agg.std_unassigned
+    println("  Rank distribution (mean fraction):")
+    for (k, frac) in enumerate(agg.mean_rank_distribution)
+        @printf "    Rank %d : %.2f%%\n" k frac * 100
+    end
+    println("=" ^ 50)
+end
+</file>
+
+<file path="src/parallel_sim.jl">
+"""
+    parallel_sim.jl
+
+Multithreaded Monte Carlo simulation using `Threads.@threads`.
+
+Each thread runs independent trials with its own RNG instance to avoid
+data races on shared mutable state. Results are written into pre-allocated
+per-trial slots so no locking is needed.
+"""
+
+using Random
+
+"""
+    run_parallel_mc(students, schools, n_trials; seed) -> Vector{TrialSummary}
+
+Run `n_trials` assignment simulations in parallel using Julia's built-in
+thread pool (`Threads.@threads`).
+
+Race-condition avoidance strategy
+----------------------------------
+- Each trial writes into a unique index of a pre-allocated `results` vector.
+- Each thread gets its own `MersenneTwister` seeded from `seed + thread_id`
+  so RNG state is never shared.
+- School capacity counters are local to each trial (not shared across threads).
+
+# Arguments
+- `students`: Base student set (preferences fixed; lottery re-drawn each trial).
+- `schools`: School definitions (capacity treated as read-only).
+- `n_trials`: Number of Monte Carlo replications.
+- `seed`: Base seed for reproducibility; thread `t` uses `seed + t`.
+"""
+function run_parallel_mc(
+    students::Vector{Student},
+    schools::Vector{School},
+    n_trials::Int;
+    seed::Int = 0,
+)::Vector{TrialSummary}
+    results = Vector{TrialSummary}(undef, n_trials)
+
+    # One RNG per trial, seeded deterministically from the base seed.
+    # We allocate all RNGs up front to keep the @threads loop allocation-free.
+    rngs = [MersenneTwister(seed + i) for i in 1:n_trials]
+
+    Threads.@threads for i in 1:n_trials
+        result = run_serial_with_fresh_lottery(students, schools; rng = rngs[i])
+        results[i] = to_trial_summary(result)
+    end
+
+    return results
+end
+
+"""
+    to_trial_summary(result::AssignmentResult) -> TrialSummary
+
+Convert a full `AssignmentResult` into the lightweight `TrialSummary` used for
+Monte Carlo aggregation.
+"""
+function to_trial_summary(result::AssignmentResult)::TrialSummary
+    n_students = length(result.assignments)
+    rank_fracs = result.rank_distribution ./ n_students
+    return TrialSummary(
+        result.first_choice_rate,
+        result.unassigned_count,
+        rank_fracs,
+    )
+end
+
+"""
+    run_parallel_scaling(students, schools, n_trials; thread_counts, seed)
+        -> Dict{Int, Float64}
+
+Benchmark parallel throughput at different logical thread-count limits.
+
+Because Julia's thread count is fixed at startup, this function simulates
+scaling by splitting `n_trials` across `k` chunks and measuring wall time
+for each `k` in `thread_counts`.
+
+Returns a Dict mapping thread count -> elapsed seconds.
+"""
+function run_parallel_scaling(
+    students::Vector{Student},
+    schools::Vector{School},
+    n_trials::Int;
+    thread_counts::Vector{Int} = [1, 2, 4, 8],
+    seed::Int = 0,
+)::Dict{Int,Float64}
+    times = Dict{Int,Float64}()
+    for k in thread_counts
+        chunk = max(1, n_trials ÷ k)
+        t0 = time()
+        # Run `chunk` trials (simulates one thread's share of work at level k)
+        run_parallel_mc(students, schools, chunk; seed = seed)
+        elapsed = time() - t0
+        times[k] = elapsed
+    end
+    return times
+end
+</file>
+
+<file path="src/plots.jl">
+"""
+    plots.jl
+
+Visualization functions using Plots.jl.
+Generates runtime scaling plots, speedup plots, and assignment distribution charts.
+"""
+
+using Plots
+
+# Use a clean default theme
+default(; fontfamily = "Computer Modern", dpi = 150, size = (700, 450))
+
+"""
+    plot_scaling(trial_counts, serial_times, parallel_times; save_path)
+
+Plot serial vs parallel runtime as a function of trial count.
+
+# Arguments
+- `trial_counts::Vector{Int}`
+- `serial_times::Vector{Float64}`: Median runtime in ms (serial MC).
+- `parallel_times::Vector{Float64}`: Median runtime in ms (parallel MC).
+- `save_path::String`: If non-empty, save the figure to this path.
+"""
+function plot_scaling(
+    trial_counts::Vector{Int},
+    serial_times::Vector{Float64},
+    parallel_times::Vector{Float64};
+    save_path::String = "",
+)
+    p = plot(
+        trial_counts, serial_times;
+        label     = "Serial",
+        marker    = :circle,
+        linewidth = 2,
+        xlabel    = "Number of Trials",
+        ylabel    = "Median Runtime (ms)",
+        title     = "Serial vs Parallel Runtime Scaling",
+        legend    = :topleft,
+    )
+    plot!(p, trial_counts, parallel_times;
+        label     = "Parallel ($(Threads.nthreads()) threads)",
+        marker    = :square,
+        linewidth = 2,
+    )
+
+    isempty(save_path) || savefig(p, save_path)
+    return p
+end
+
+"""
+    plot_speedup(trial_counts, serial_times, parallel_times; save_path)
+
+Plot parallel speedup (serial / parallel) as a function of trial count.
+Includes a dashed line at speedup = 1 for reference.
+"""
+function plot_speedup(
+    trial_counts::Vector{Int},
+    serial_times::Vector{Float64},
+    parallel_times::Vector{Float64};
+    save_path::String = "",
+)
+    speedups = serial_times ./ parallel_times
+    p = plot(
+        trial_counts, speedups;
+        label     = "Speedup",
+        marker    = :diamond,
+        linewidth = 2,
+        color     = :green,
+        xlabel    = "Number of Trials",
+        ylabel    = "Speedup (serial / parallel)",
+        title     = "Parallel Speedup  ($(Threads.nthreads()) threads)",
+        legend    = :bottomright,
+        ylims     = (0, max(Threads.nthreads() + 1, maximum(speedups) * 1.15)),
+    )
+    hline!(p, [1.0]; label = "No speedup", linestyle = :dash, color = :red)
+    hline!(p, [Threads.nthreads()]; label = "Ideal speedup",
+           linestyle = :dot, color = :gray)
+
+    isempty(save_path) || savefig(p, save_path)
+    return p
+end
+
+"""
+    plot_rank_distribution(mean_rank_dist; save_path)
+
+Bar chart of the average fraction of students assigned at each preference rank.
+"""
+function plot_rank_distribution(
+    mean_rank_dist::Vector{Float64};
+    save_path::String = "",
+)
+    ranks = 1:length(mean_rank_dist)
+    p = bar(
+        ranks, mean_rank_dist .* 100;
+        xlabel    = "Assigned Rank",
+        ylabel    = "Fraction of Students (%)",
+        title     = "Assignment Rank Distribution (Monte Carlo Mean)",
+        legend    = false,
+        color     = :steelblue,
+        alpha     = 0.8,
+        xticks    = collect(ranks),
+    )
+    annotate!(p,
+        length(ranks) + 0.5, maximum(mean_rank_dist) * 100 * 0.95,
+        text("Unassigned\nnot shown", 8, :right, :gray),
+    )
+
+    isempty(save_path) || savefig(p, save_path)
+    return p
+end
+
+"""
+    plot_first_choice_distribution(summaries; save_path)
+
+Histogram of per-trial first-choice assignment rates across all Monte Carlo trials.
+"""
+function plot_first_choice_distribution(
+    summaries::Vector{TrialSummary};
+    save_path::String = "",
+)
+    rates = [s.first_choice_rate * 100 for s in summaries]
+    p = histogram(
+        rates;
+        bins      = 20,
+        xlabel    = "First-Choice Assignment Rate (%)",
+        ylabel    = "Count",
+        title     = "Distribution of First-Choice Rates Across Trials",
+        legend    = false,
+        color     = :salmon,
+        alpha     = 0.8,
+    )
+
+    isempty(save_path) || savefig(p, save_path)
+    return p
+end
+
+"""
+    save_all_figures(trial_counts, serial_times, parallel_times, summaries, agg;
+                     dir)
+
+Generate and save all standard figures to `dir`.
+"""
+function save_all_figures(
+    trial_counts::Vector{Int},
+    serial_times::Vector{Float64},
+    parallel_times::Vector{Float64},
+    summaries::Vector{TrialSummary},
+    agg;
+    dir::String = "results/figures",
+)
+    mkpath(dir)
+    plot_scaling(trial_counts, serial_times, parallel_times;
+        save_path = joinpath(dir, "scaling.png"))
+    plot_speedup(trial_counts, serial_times, parallel_times;
+        save_path = joinpath(dir, "speedup.png"))
+    plot_rank_distribution(agg.mean_rank_distribution;
+        save_path = joinpath(dir, "rank_distribution.png"))
+    plot_first_choice_distribution(summaries;
+        save_path = joinpath(dir, "first_choice_histogram.png"))
+    println("Figures saved to $dir/")
+end
+</file>
+
+<file path="src/serial_sim.jl">
+"""
+    serial_sim.jl
+
+Baseline serial implementation of the lottery-based school assignment algorithm.
+Students are processed in ascending lottery-number order; each student is placed
+into the highest-ranked school on their preference list that still has remaining
+capacity.
+"""
+
+"""
+    run_serial(students, schools) -> AssignmentResult
+
+Run the serial deferred-acceptance-style lottery assignment.
+
+Algorithm
+---------
+1. Sort students by lottery number (ascending → lower number = higher priority).
+2. For each student, iterate through their ranked preferences.
+3. Assign the student to the first school that has remaining capacity.
+4. Collect statistics.
+
+Returns an `AssignmentResult` with per-student assignments and summary metrics.
+"""
+function run_serial(
+    students::Vector{Student},
+    schools::Vector{School},
+)::AssignmentResult
+    n_students = length(students)
+    n_schools  = length(schools)
+    pref_length = isempty(students) ? 0 : length(students[1].preferences)
+
+    # Mutable capacity counters (one per school, indexed by school id)
+    remaining = Dict(s.id => s.capacity for s in schools)
+
+    # Sort by lottery number — lower value wins priority
+    sorted_students = sort(students; by = s -> s.lottery_number)
+
+    assignments = zeros(Int, n_students)          # student index -> school id
+    rank_distribution = zeros(Int, pref_length)   # rank -> count
+
+    for student in sorted_students
+        for (rank, school_id) in enumerate(student.preferences)
+            if remaining[school_id] > 0
+                assignments[student.id] = school_id
+                remaining[school_id] -= 1
+                rank_distribution[rank] += 1
+                break
+            end
+        end
+        # If no school had space, assignments[student.id] stays 0 (unassigned)
+    end
+
+    first_choice_count = rank_distribution[1]
+    unassigned = count(==(0), assignments)
+
+    return AssignmentResult(
+        assignments,
+        first_choice_count / n_students,
+        unassigned,
+        rank_distribution,
+    )
+end
+
+"""
+    run_serial_with_fresh_lottery(students, schools; rng) -> AssignmentResult
+
+Re-draw lottery numbers for each student (preserving preferences) and run the
+serial assignment. Used by Monte Carlo orchestration so each trial is independent.
+"""
+function run_serial_with_fresh_lottery(
+    students::Vector{Student},
+    schools::Vector{School};
+    rng::AbstractRNG = Random.GLOBAL_RNG,
+)::AssignmentResult
+    redrawn = [Student(s.id, s.preferences, rand(rng)) for s in students]
+    return run_serial(redrawn, schools)
+end
+</file>
+
+<file path="src/types.jl">
+"""
+    types.jl
+
+Core data structures for the school assignment simulation.
+"""
+
+"""
+    Student
+
+Represents a student in the lottery-based school assignment system.
+
+# Fields
+- `id::Int`: Unique student identifier.
+- `preferences::Vector{Int}`: Ranked list of school IDs (index 1 = most preferred).
+- `lottery_number::Float64`: Random draw in [0, 1) used to order students for assignment.
+"""
+struct Student
+    id::Int
+    preferences::Vector{Int}
+    lottery_number::Float64
+end
+
+"""
+    School
+
+Represents a school in the assignment system.
+
+# Fields
+- `id::Int`: Unique school identifier.
+- `capacity::Int`: Maximum number of students the school can accept.
+- `name::String`: Human-readable label (e.g., "School 3").
+"""
+struct School
+    id::Int
+    capacity::Int
+    name::String
+end
+
+"""
+    AssignmentResult
+
+Stores the outcome of a single assignment run.
+
+# Fields
+- `assignments::Vector{Int}`: `assignments[student_id]` = school id, or 0 if unassigned.
+- `first_choice_rate::Float64`: Fraction of students assigned to their top-ranked school.
+- `unassigned_count::Int`: Number of students who received no assignment.
+- `rank_distribution::Vector{Int}`: `rank_distribution[k]` = number of students assigned to their k-th choice.
+"""
+struct AssignmentResult
+    assignments::Vector{Int}           # student id -> school id (0 = unassigned)
+    first_choice_rate::Float64
+    unassigned_count::Int
+    rank_distribution::Vector{Int}     # index k -> count assigned to k-th choice
+end
+
+"""
+    TrialSummary
+
+Summary statistics from one Monte Carlo trial.
+
+# Fields
+- `first_choice_rate::Float64`
+- `unassigned_count::Int`
+- `rank_distribution::Vector{Float64}`: Fraction assigned at each rank.
+"""
+struct TrialSummary
+    first_choice_rate::Float64
+    unassigned_count::Int
+    rank_distribution::Vector{Float64}
+end
+</file>
+
+<file path="test/runtests.jl">
+"""
+runtests.jl
+
+Basic correctness tests for the school assignment simulation.
+
+Run with:
+    julia --project test/runtests.jl
+    # or from the REPL:
+    # using Pkg; Pkg.test()
+"""
+
+using Test, Random
+
+# Load source files relative to the project root
+const PROJECT_ROOT = joinpath(@__DIR__, "..")
+include(joinpath(PROJECT_ROOT, "src", "types.jl"))
+include(joinpath(PROJECT_ROOT, "src", "generate_data.jl"))
+include(joinpath(PROJECT_ROOT, "src", "serial_sim.jl"))
+include(joinpath(PROJECT_ROOT, "src", "parallel_sim.jl"))
+include(joinpath(PROJECT_ROOT, "src", "monte_carlo.jl"))
+
+# ── Fixture ───────────────────────────────────────────────────────────────────
+const N_STUDENTS  = 500
+const N_SCHOOLS   = 10
+const PREF_LENGTH = 4
+
+students, schools = generate_scenario(;
+    n_students  = N_STUDENTS,
+    n_schools   = N_SCHOOLS,
+    pref_length = PREF_LENGTH,
+    seed        = 99,
+)
+
+@testset "ParallelSchoolAssignmentSim" begin
+
+    # ── Data generation ────────────────────────────────────────────────────────
+    @testset "Data generation" begin
+        @test length(students) == N_STUDENTS
+        @test length(schools)  == N_SCHOOLS
+
+        for s in students
+            @test length(s.preferences) == PREF_LENGTH
+            @test allunique(s.preferences)
+            @test all(1 <= p <= N_SCHOOLS for p in s.preferences)
+            @test 0.0 <= s.lottery_number < 1.0
+        end
+
+        for sch in schools
+            @test sch.capacity > 0
+            @test !isempty(sch.name)
+        end
+    end
+
+    # ── Serial assignment ──────────────────────────────────────────────────────
+    @testset "Serial assignment — validity" begin
+        result = run_serial(students, schools)
+
+        # No student assigned to more than one school
+        assigned_ids = filter(!=(0), result.assignments)
+        @test length(assigned_ids) == length(unique(i for (i, v) in enumerate(result.assignments) if v != 0))
+
+        # Each student appears at most once
+        @test length(result.assignments) == N_STUDENTS
+
+        # No school exceeds its capacity
+        school_counts = Dict(sch.id => 0 for sch in schools)
+        for sid in 1:N_STUDENTS
+            sid_school = result.assignments[sid]
+            sid_school == 0 && continue
+            school_counts[sid_school] += 1
+        end
+        capacity_map = Dict(sch.id => sch.capacity for sch in schools)
+        for (sid, cnt) in school_counts
+            @test cnt <= capacity_map[sid]
+        end
+
+        # Unassigned count must match
+        n_assigned = count(!=(0), result.assignments)
+        @test result.unassigned_count == N_STUDENTS - n_assigned
+
+        # First-choice rate in [0, 1]
+        @test 0.0 <= result.first_choice_rate <= 1.0
+
+        # Rank distribution sums to assigned count
+        @test sum(result.rank_distribution) == n_assigned
+    end
+
+    # ── Parallel MC ───────────────────────────────────────────────────────────
+    @testset "Parallel Monte Carlo — structure" begin
+        summaries = run_parallel_mc(students, schools, 10; seed = 7)
+
+        @test length(summaries) == 10
+        for s in summaries
+            @test 0.0 <= s.first_choice_rate <= 1.0
+            @test s.unassigned_count >= 0
+            @test length(s.rank_distribution) == PREF_LENGTH
+            @test all(>=(0.0), s.rank_distribution)
+        end
+    end
+
+    # ── Serial vs parallel produce plausible outputs ───────────────────────────
+    @testset "Serial MC — structure" begin
+        summaries = run_serial_mc(students, schools, 10; seed = 7)
+
+        @test length(summaries) == 10
+        for s in summaries
+            @test 0.0 <= s.first_choice_rate <= 1.0
+        end
+    end
+
+    # ── Aggregation ────────────────────────────────────────────────────────────
+    @testset "Aggregation" begin
+        summaries = run_serial_mc(students, schools, 20; seed = 5)
+        agg = aggregate_results(summaries)
+
+        @test agg.n_trials == 20
+        @test 0.0 <= agg.mean_first_choice_rate <= 1.0
+        @test agg.std_first_choice_rate >= 0.0
+        @test agg.mean_unassigned >= 0.0
+        @test length(agg.mean_rank_distribution) == PREF_LENGTH
+    end
+
+    # ── Edge case: single student, ample capacity ──────────────────────────────
+    @testset "Edge case — single student" begin
+        one_student = [Student(1, [1, 2, 3], 0.5)]
+        big_schools = [School(i, 1000, "S$i") for i in 1:3]
+        result = run_serial(one_student, big_schools)
+
+        @test result.assignments[1] == 1   # top choice should be assigned
+        @test result.first_choice_rate == 1.0
+        @test result.unassigned_count == 0
+    end
+
+    # ── Edge case: zero capacity (all students unassigned) ─────────────────────
+    @testset "Edge case — zero capacity" begin
+        zero_schools = [School(i, 0, "S$i") for i in 1:N_SCHOOLS]
+        result = run_serial(students, zero_schools)
+
+        @test all(==(0), result.assignments)
+        @test result.unassigned_count == N_STUDENTS
+        @test result.first_choice_rate == 0.0
+    end
+
+end
+</file>
+
+</files>
