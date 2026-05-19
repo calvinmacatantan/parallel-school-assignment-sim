@@ -19,7 +19,7 @@ lottery draws, and measures both runtime and assignment quality — specifically
 
 | Algorithm | Stability | Intra-trial parallelism | Notes |
 |---|---|---|---|
-| **Boston** | ✗ (can have blocking pairs) | None | O(N log N), one pass |
+| **Boston** | ✓ (stable — serial dictatorship) | None | O(N log N), one pass |
 | **Deferred Acceptance (DA)** | ✓ (zero blocking pairs) | School-resolution step | Batch Gale-Shapley, ≤ `pref_length` rounds |
 | **Batched DA** | Partial (zero within bands) | Intra-band resolution | Quality/speed trade-off tunable via `n_batches` |
 
@@ -125,9 +125,10 @@ compare_strategies(students, schools, 50)
 
 The original baseline. Students are sorted by lottery number (ascending = higher
 priority) and each student is immediately assigned to the best available school
-on their list. Fast but **not stable**: blocking pairs exist when a student
-prefers a school that would have accepted them over a lower-priority student who
-got there first.
+on their list. This implementation is **serial dictatorship**: students are
+processed in strict lottery order, so every school is filled exclusively by
+students with better (lower) lottery numbers than any student who was rejected.
+This guarantees stability — no blocking pairs are possible.
 
 Time complexity: **O(N log N + N·P)** where N = students, P = preference list length.
 
@@ -154,10 +155,13 @@ Within each band's DA, the school-resolution step is parallelised.
 
 **Trade-off:**
 - `n_batches = 1` is equivalent to full DA (zero blocking pairs).
-- Increasing `n_batches` exposes more intra-trial parallelism but introduces
-  blocking pairs at band boundaries (a band-2 student may be blocked by a
-  worse-lottery band-1 student). Blocking pairs are bounded by the number of
-  cross-band preference conflicts.
+- Increasing `n_batches` exposes more intra-trial parallelism with **no
+  loss in stability**. Because bands are formed by lottery rank order, all
+  band-k students have better lottery numbers than any band-(k+1) student,
+  so later-band students can never displace earlier-band students. Blocking
+  pairs across band boundaries are structurally impossible.
+- The measurable benefit is speed: B=8 is approximately 2× faster than B=1
+  in a tight market because smaller bands require fewer DA proposal rounds.
 
 ---
 
@@ -195,9 +199,9 @@ A blocking pair `(student s, school x)` exists when:
 2. `x` would accept `s`: either `x` has remaining capacity, or `x` holds a
    student with a worse lottery number (lower priority) than `s`.
 
-DA always produces **0 blocking pairs**. Boston typically produces >0 under
-tight market conditions. Batched DA produces blocking pairs only at band
-boundaries.
+DA always produces **0 blocking pairs**. Boston (as implemented — serial
+dictatorship) also produces 0 blocking pairs. Batched DA likewise produces
+0 blocking pairs because lottery-sorted banding prevents cross-band displacement.
 
 ```julia
 bp = count_blocking_pairs(result, students, schools)
@@ -242,18 +246,28 @@ run_monte_carlo(students, schools, 50;
 
 ## Benchmark Results
 
-Measured on 8 threads, 50 trials, 10,000 students, 20 schools:
+Measured on 8 threads, 50 trials, 10,000 students, 20 schools, `base_capacity=300`
+(tight market: ~6,000 seats for 10,000 students, ~40% unassigned):
 
 ```
 ============================================================
 Benchmark Results
   Julia threads available: 8
   Monte Carlo trials     : 50
+  Market                 : tight (base_capacity=300)
 ============================================================
-  Serial (single run)                 0.72 ms     0.57 MB
-  Serial MC                          38.85 ms    41.04 MB
-  Parallel MC                         7.11 ms    42.06 MB
-  Parallel speedup                    5.46x
+  Strategy             Blocking pairs   Time (ms)
+  Boston                     0            9.47
+  DA (serial resolve)        0           51.13
+  DA (parallel resolve)      0           51.49
+  Batched DA (B=4)           0           34.97
+============================================================
+  Parallel speedup vs serial (Boston, N_trials sweep):
+    10 trials:   3.2x
+    25 trials:   4.5x
+    50 trials:   4.7x
+   100 trials:   5.1x
+   200 trials:   6.5x
 ============================================================
 ```
 
@@ -266,11 +280,11 @@ Benchmark Results
 | `n_students`    | 10,000  | Number of students in the lottery    |
 | `n_schools`     | 20      | Number of available schools          |
 | `pref_length`   | 5       | Length of each student's rank list   |
-| `base_capacity` | 600     | Mean school capacity (±50%)          |
+| `base_capacity` | 300     | Mean school capacity (±50%)          |
 | `n_trials`      | 50      | Monte Carlo replications             |
 | `n_batches`     | 4       | Bands for `BatchedDAStrategy`        |
 
-Total system capacity ≈ 20 × 600 = 12,000 seats for 10,000 students.
+Total system capacity ≈ 20 × 300 = 6,000 seats for 10,000 students (~40% shortage).
 
 ---
 
@@ -285,7 +299,7 @@ The test suite verifies:
 - No school exceeds its capacity after any algorithm runs.
 - DA produces **zero blocking pairs** on all tested inputs.
 - `BatchedDA(1)` is equivalent to full DA.
-- More bands produce ≥ blocking pairs than fewer bands (monotonicity).
+- All band counts produce 0 blocking pairs (lottery-sorted banding is stable).
 - Parallel-resolve DA produces the same assignment as serial-resolve DA.
 - `@threads` and `@spawn` MC runners return valid `TrialSummary` structs.
 - All four strategies work through the strategy-dispatch interface.
